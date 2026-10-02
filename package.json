@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
+    "bench": "tsc -p tsconfig.test.json && node dist-test/bench/bench.js"
   },
   "dependencies": {
     "react": "^19.3.0",
