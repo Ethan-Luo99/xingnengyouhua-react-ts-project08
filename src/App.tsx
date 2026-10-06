@@ -5,6 +5,8 @@ import { SummaryPanel } from './panel/SummaryPanel.tsx'
 
 export default function App() {
   const [text, setText] = useState('')
+  const [undoDepth, setUndoDepth] = useState(0)
+  const [lastError, setLastError] = useState<string | null>(null)
   const stats = useStatsSnapshot()
 
   useEffect(() => {
@@ -22,14 +24,32 @@ export default function App() {
           onChange={(event) => {
             const next = event.target.value
             setText(next) // 回显：高优先级
-            panelStore.setInput(next) // 重算：事件层驱动，绝不在 render 内执行
+            const result = panelStore.setInput(next)
+            setUndoDepth(panelStore.getUndoDepth())
+            setLastError(result.failed ? '上一批次执行失败，已整体回滚' : null)
+            if (result.failed) setText(String(panelStore.engine.ctx['input.text'] ?? ''))
           }}
         />
       </label>
+      <button
+        type="button"
+        disabled={undoDepth === 0}
+        onClick={() => {
+          if (panelStore.getUndoDepth() === 0) return
+          const result = panelStore.undoLastBatch()
+          setUndoDepth(panelStore.getUndoDepth())
+          setLastError(result.failed ? '撤销批次执行失败，已回滚' : null)
+          setText(String(panelStore.engine.ctx['input.text'] ?? ''))
+        }}
+      >
+        撤销上一批次（剩 {undoDepth} 层）
+      </button>
       <p>
         最近一批 v{stats.version}：重算 {stats.executed} / 跳过 {stats.skipped} 个函数， 主线程阻塞{' '}
-        {stats.durationMs.toFixed(1)}ms
+        {stats.durationMs.toFixed(1)}ms{stats.reverted ? '（undo 增量恢复）' : ''}
+        {stats.failed ? '，批次失败已回滚' : ''}
       </p>
+      {lastError ? <p role="alert">{lastError}</p> : null}
       <SummaryPanel />
     </main>
   )

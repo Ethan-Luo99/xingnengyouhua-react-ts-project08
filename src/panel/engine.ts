@@ -1,9 +1,16 @@
-import type { Ctx, FnEntry, Registry, RunStats } from './types.ts'
+import type { BatchFailureInfo, Ctx, FnEntry, Registry, RunStats } from './types.ts'
 
 export class CycleError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'CycleError'
+  }
+}
+
+export class UndoError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'UndoError'
   }
 }
 
@@ -29,6 +36,13 @@ export interface EngineOptions {
   /** Proxy 读追踪兜底（默认开启）；关闭后只信显式声明 */
   trackReadsWithProxy?: boolean
   onImplicitDep?: (fnName: string, field: string) => void
+  /**
+   * 错误明确通道：批次内任一业务函数抛错时回调。
+   * 批次整体回滚（ctx 保持上一提交点），该回调只负责上报，不改变回滚行为。
+   */
+  onBatchFailure?: (info: BatchFailureInfo) => void
+  /** undo 历史最大层数（默认 50，至少支持连续 5 层） */
+  maxUndoDepth?: number
 }
 
 interface RunState {
@@ -41,9 +55,49 @@ interface RunState {
   stats: RunStats
   startedAt: number
   chunkStart: number
+  failed: boolean
+  failedFn: string | null
+  reverted: boolean
+  errorValue: unknown
+  /** 本批次启动时从 pendingFns/pendingFields 抽干的项：失败时需要还回去 */
+  drainedFns: Set<string>
+  drainedFields: Set<string>
+  /** undo 重放对应的历史记录：undo 失败时重新入栈，保留撤销点 */
+  undoLog: BatchLog | null
 }
 
+/**
+ * 单次提交的字段级历史记录（undo 的唯一持久状态）。
+ *
+ * 空间复杂度 O(该批次实际改变的字段数 + 当轮首次执行的动态注册函数数)，
+ * 与 ctx 总大小无关——不做任何全量深拷贝：
+ * - `changes` 只保存提交时 overlay 中相对 ctx 真正发生变化（!Object.is）
+ *   的字段及其【提交前旧值】；未写或写了但值未变的字段一律不记。
+ * - 恢复时把旧值以 overlay 方式暂存，跑同一套 dirty 传播，只重算
+ *   "读这些字段"的受影响子图，绝不全量重跑 600 个函数。
+ * - `firstForced` 只对当轮首次执行的动态注册函数打标：它的首执行
+ *   不依赖输入变化，undo 重放时必须同样强制一次，才能与全量语义逐字段一致。
+ */
+interface BatchLog {
+  version: number
+  changes: Map<string, unknown>
+  firstForced: Set<string>
+  /**
+   * 该批次是否发生在冷启动整体失效点上（此前无任何已计算提交点）。
+   * 撤销它时不存在可增量命中的"上一派生状态"，只能对恢复后的输入
+   * 整体重算一次；真实面板由 ensureComputed 建立基线，用户批次永不命中此分支。
+   */
+  fromFull: boolean
+}
+
+/** overlay 内标记"ctx 中不存在该键"：回滚/恢复时删除而不是写入 undefined */
+const ABSENT = Symbol('absent')
+
 const yieldToMain = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+/** 相等性：ABSENT 哨兵只与自身相等（Object.is 会把 Symbol 当普通值，不能用于"不存在"判定） */
+const isSameValue = (a: unknown, b: unknown): boolean =>
+  a === ABSENT || b === ABSENT ? a === b : Object.is(a, b)
 
 const addToMulti = (index: Map<string, Set<string>>, field: string, name: string): void => {
   let set = index.get(field)
@@ -66,6 +120,10 @@ export class IncrementalEngine {
   private readonly pendingFns = new Set<string>()
   private readonly proxyTracking: boolean
   private readonly onImplicitDep?: (fnName: string, field: string) => void
+  private readonly onBatchFailure?: (info: BatchFailureInfo) => void
+  private readonly maxUndoDepth: number
+  /** 已提交批次的字段级历史栈，栈顶 = 最近一次提交 */
+  private readonly undoStack: BatchLog[] = []
   private lastStats: RunStats = {
     version: 0,
     executed: 0,
@@ -73,6 +131,8 @@ export class IncrementalEngine {
     durationMs: 0,
     aborted: false,
     implicitDepsFound: 0,
+    failed: false,
+    reverted: false,
   }
   private readonly listeners = new Set<() => void>()
   private inFlight: Promise<RunStats> | null = null
@@ -81,6 +141,8 @@ export class IncrementalEngine {
     this.ctx = ctx
     this.proxyTracking = options.trackReadsWithProxy ?? true
     this.onImplicitDep = options.onImplicitDep
+    this.onBatchFailure = options.onBatchFailure
+    this.maxUndoDepth = options.maxUndoDepth ?? 50
     this.loadRegistry(registry)
   }
 
@@ -90,6 +152,11 @@ export class IncrementalEngine {
 
   get committed(): number {
     return this.committedVersion
+  }
+
+  /** 可撤销的已提交批次数 */
+  get undoDepth(): number {
+    return this.undoStack.length
   }
 
   getStats(): RunStats {
@@ -123,6 +190,9 @@ export class IncrementalEngine {
     this.loadRegistry(registry)
     this.pendingFields.clear()
     this.pendingFns.clear()
+    // 函数实现已整体变更：旧历史记录里的字段旧值对新实现不再有语义，
+    // 全部作废，防止 undo 跨实现版本恢复出混合语义的 ctx。
+    this.undoStack.length = 0
     this.version++ // 使在飞批次立即过期
   }
 
@@ -259,9 +329,9 @@ export class IncrementalEngine {
   // ---- 执行 ----
 
   applyInput(patch: Record<string, unknown>): RunStats {
-    const changed = this.applyPatch(patch)
+    const { changed, overlay, drainedFields } = this.stagePatch(patch)
     if (!this.hasWork(changed)) return this.lastStats
-    const state = this.beginRun(++this.version, changed, false)
+    const state = this.beginRun(++this.version, changed, false, overlay, drainedFields)
     while (!this.runSlice(state, Number.POSITIVE_INFINITY)) {
       // 同步执行到底
     }
@@ -269,20 +339,41 @@ export class IncrementalEngine {
   }
 
   async applyInputChunked(patch: Record<string, unknown>, budgetMs = 24): Promise<RunStats> {
-    const changed = this.applyPatch(patch)
+    const { changed, overlay, drainedFields } = this.stagePatch(patch)
     if (!this.hasWork(changed)) return this.lastStats
-    const state = this.beginRun(++this.version, changed, false)
+    const state = this.beginRun(++this.version, changed, false, overlay, drainedFields)
     while (!this.runSlice(state, budgetMs)) await yieldToMain()
     return this.commitRun(state)
   }
 
   /** 优化前基线：无视 dirty，全量执行所有函数（语义等价参照物） */
   runFull(patch: Record<string, unknown> = {}): RunStats {
-    const changed = this.applyPatch(patch)
-    const state = this.beginRun(++this.version, changed, true)
+    const { changed, overlay, drainedFields } = this.stagePatch(patch)
+    const state = this.beginRun(++this.version, changed, true, overlay, drainedFields)
     while (!this.runSlice(state, Number.POSITIVE_INFINITY)) {
       // 同步执行到底
     }
+    return this.commitRun(state)
+  }
+
+  /**
+   * 撤销最近一次已提交批次：
+   * 1. 取出栈顶 BatchLog（字段旧值 + 当轮首执行的动态函数）；
+   * 2. 旧值以 overlay 暂存（不触碰 ctx），仅把这些字段标记为 changed；
+   * 3. 走同一趟顺序扫描 + dirty 传播，只重算受影响子图；
+   * 4. 成功则提交（恢复点成为新的已提交状态，不再产生 undo 记录）。
+   */
+  undoLastBatch(): RunStats {
+    const state = this.beginUndo()
+    while (!this.runSlice(state, Number.POSITIVE_INFINITY)) {
+      // 同步执行到底
+    }
+    return this.commitRun(state)
+  }
+
+  async undoLastBatchChunked(budgetMs = 24): Promise<RunStats> {
+    const state = this.beginUndo()
+    while (!this.runSlice(state, budgetMs)) await yieldToMain()
     return this.commitRun(state)
   }
 
@@ -302,22 +393,97 @@ export class IncrementalEngine {
     return this.fullInvalidation || changed.size > 0 || this.pendingFns.size > 0
   }
 
-  private applyPatch(patch: Record<string, unknown>): Set<string> {
+  /**
+   * 输入补丁只暂存进 overlay（批次隔离的关键）：批次失败/被新版本丢弃时，
+   * ctx 从未被触碰，物理上不存在"半提交"，无需反向修补输入。
+   */
+  private stagePatch(patch: Record<string, unknown>): { changed: Set<string>; overlay: Map<string, unknown>; drainedFields: Set<string> } {
     const changed = new Set<string>()
+    const overlay = new Map<string, unknown>()
     for (const [key, value] of Object.entries(patch)) {
-      if (!Object.is(this.ctx[key], value)) {
-        this.ctx[key] = value
+      const current = key in this.ctx ? this.ctx[key] : ABSENT
+      if (!isSameValue(current, value)) {
+        overlay.set(key, value)
         changed.add(key)
       }
     }
-    for (const field of this.pendingFields) changed.add(field)
+    const drainedFields = new Set(this.pendingFields)
+    for (const field of drainedFields) changed.add(field)
     this.pendingFields.clear()
-    return changed
+    return { changed, overlay, drainedFields }
   }
 
-  private beginRun(version: number, changed: Set<string>, forceAll: boolean): RunState {
+  private beginUndo(): RunState {
+    const log = this.undoStack.pop()
+    if (!log) {
+      throw new UndoError('没有可撤销的已提交批次')
+    }
+    // 把字段恢复值暂存进 overlay；changed 只含真正变化的字段 =>
+    // dirty 传播精确命中"该批次写入字段的下游子图"，非 600 全量。
+    const changed = new Set<string>()
+    const overlay = new Map<string, unknown>()
+    for (const [field, oldValue] of log.changes) {
+      const current = field in this.ctx ? this.ctx[field] : ABSENT
+      if (!isSameValue(current, oldValue)) {
+        overlay.set(field, oldValue)
+        changed.add(field)
+      }
+    }
+    // 动态注册函数是结构性变化（不属于输入批次，undo 不注销）；
+    // 它在原批次首执行时与输入无关，恢复重放需同样强制一次，
+    // 保证恢复后 ctx 与"只经历恢复后输入序列"的全量结果逐字段一致。
     const forced = new Set<string>()
-    for (const name of this.pendingFns) forced.add(name)
+    for (const name of log.firstForced) {
+      if (this.entries.has(name)) forced.add(name)
+    }
+    const drainedFns = new Set(this.pendingFns)
+    for (const name of drainedFns) {
+      forced.add(name)
+    }
+    this.pendingFns.clear()
+    const drainedFields = new Set(this.pendingFields)
+    for (const field of drainedFields) changed.add(field)
+    this.pendingFields.clear()
+    const now = performance.now()
+    return {
+      version: ++this.version,
+      forceAll: log.fromFull,
+      changed,
+      forced,
+      overlay,
+      cursor: this.entries.entries(),
+      stats: {
+        version: this.version,
+        executed: 0,
+        skipped: 0,
+        durationMs: 0,
+        aborted: false,
+        implicitDepsFound: 0,
+        failed: false,
+        reverted: true,
+      },
+      startedAt: now,
+      chunkStart: now,
+      failed: false,
+      failedFn: null,
+      reverted: true,
+      errorValue: undefined,
+      drainedFns,
+      drainedFields,
+      undoLog: log,
+    }
+  }
+
+  private beginRun(
+    version: number,
+    changed: Set<string>,
+    forceAll: boolean,
+    overlay: Map<string, unknown>,
+    drainedFields: Set<string>,
+  ): RunState {
+    const forced = new Set<string>()
+    const drainedFns = new Set(this.pendingFns)
+    for (const name of drainedFns) forced.add(name)
     this.pendingFns.clear()
     const now = performance.now()
     return {
@@ -325,11 +491,18 @@ export class IncrementalEngine {
       forceAll,
       changed,
       forced,
-      overlay: new Map(),
+      overlay,
       cursor: this.entries.entries(),
-      stats: { version, executed: 0, skipped: 0, durationMs: 0, aborted: false, implicitDepsFound: 0 },
+      stats: { version, executed: 0, skipped: 0, durationMs: 0, aborted: false, implicitDepsFound: 0, failed: false, reverted: false },
       startedAt: now,
       chunkStart: now,
+      failed: false,
+      failedFn: null,
+      reverted: false,
+      errorValue: undefined,
+      drainedFns,
+      drainedFields,
+      undoLog: null,
     }
   }
 
@@ -351,7 +524,16 @@ export class IncrementalEngine {
         state.stats.skipped++
         continue
       }
-      this.executeOne(name, entry, state)
+      try {
+        this.executeOne(name, entry, state)
+      } catch (error) {
+        // 业务函数抛错：立即停止本批次扫描，overlay 整体丢弃。
+        state.failed = true
+        state.failedFn = name
+        state.stats.failed = true
+        state.errorValue = error
+        return true
+      }
       state.stats.executed++
       if (performance.now() - state.chunkStart >= budgetMs) {
         state.chunkStart = performance.now()
@@ -377,9 +559,13 @@ export class IncrementalEngine {
       this.reconcileImplicit(name, entry, actualReads, actualWrites, state)
     }
     for (const field of entry.allWrites) {
-      const value = state.overlay.has(field) ? state.overlay.get(field) : this.ctx[field]
-      if (!Object.is(value, this.ctx[field])) state.changed.add(field)
+      const value = state.overlay.has(field) ? state.overlay.get(field) : this.readCommitted(field)
+      if (!Object.is(value, this.readCommitted(field))) state.changed.add(field)
     }
+  }
+
+  private readCommitted(field: string): unknown {
+    return field in this.ctx ? this.ctx[field] : undefined
   }
 
   private makeScope(
@@ -392,7 +578,11 @@ export class IncrementalEngine {
       get(target, prop) {
         if (typeof prop !== 'string') return Reflect.get(target, prop)
         reads?.add(prop)
-        return overlay.has(prop) ? overlay.get(prop) : Reflect.get(target, prop)
+        if (overlay.has(prop)) {
+          const value = overlay.get(prop)
+          return value === ABSENT ? undefined : value
+        }
+        return Reflect.get(target, prop)
       },
       set(target, prop, value) {
         if (typeof prop !== 'string') return Reflect.set(target, prop, value)
@@ -452,14 +642,64 @@ export class IncrementalEngine {
 
   private commitRun(state: RunState): RunStats {
     state.stats.durationMs = performance.now() - state.startedAt
-    if (state.stats.aborted || state.version !== this.version) {
-      // 过期批次：丢弃 overlay，不触碰 ctx，不通知订阅者
-      state.stats.aborted = true
+
+    // 失败批次：overlay 物理丢弃，ctx 一字段未动，停在上一提交点；
+    // 版本号已 +1 使可能在飞的其他批次过期。错误经明确通道上报。
+    if (state.failed) {
+      // 归还启动时抽干的待处理项：下一次成功输入必须仍能强制首执行
+      // 动态注册函数、仍能把注销字段的下游按全量语义重算。
+      for (const name of state.drainedFns) {
+        if (this.entries.has(name)) this.pendingFns.add(name)
+      }
+      for (const field of state.drainedFields) this.pendingFields.add(field)
+      // undo 自身失败：恢复点保留，调用方可修正后重试 undo。
+      if (state.undoLog) this.undoStack.push(state.undoLog)
+      this.lastStats = state.stats
+      this.onBatchFailure?.({ version: state.version, fnName: state.failedFn ?? '', error: state.errorValue })
       return state.stats
     }
-    for (const [key, value] of state.overlay) this.ctx[key] = value
+
+    // 过期批次：丢弃 overlay，不触碰 ctx，不通知订阅者。
+    if (state.stats.aborted || state.version !== this.version) {
+      state.stats.aborted = true
+      // undo 被更新版本打断：按引擎既有版本语义，旧批次（含其撤销意图）作废，
+      // 该撤销点在 beginUndo 时已出栈并在此消费——栈与已提交状态序列保持一致：
+      // 撤销一层 + 新提交一层，深度不变；再 undo 即恢复到新输入的前一状态。
+      this.lastStats = state.stats
+      return state.stats
+    }
+
+    if (state.reverted) {
+      // undo 提交：恢复字段 + 受影响子图重算结果一起落盘，不产生新历史记录。
+      for (const [key, value] of state.overlay) {
+        if (value === ABSENT) delete this.ctx[key]
+        else this.ctx[key] = value
+      }
+      this.committedVersion = state.version
+      this.fullInvalidation = false
+      this.lastStats = state.stats
+      this.emit()
+      return state.stats
+    }
+
+    // 正常提交：构建字段级历史（只记真正变化字段的提交前旧值）后再落盘。
+    const changes = new Map<string, unknown>()
+    for (const [key, value] of state.overlay) {
+      const before = key in this.ctx ? this.ctx[key] : ABSENT
+      if (!isSameValue(before, value)) changes.set(key, before)
+      if (value === ABSENT) delete this.ctx[key]
+      else this.ctx[key] = value
+    }
+    // 当轮首执行的动态注册函数：下一次 undo 恢复时需要同等强制一次。
+    const firstForced = new Set(state.forced)
+    const fromFull = this.fullInvalidation
+
     this.committedVersion = state.version
     this.fullInvalidation = false
+    if (changes.size > 0 || firstForced.size > 0) {
+      this.undoStack.push({ version: state.version, changes, firstForced, fromFull })
+      if (this.undoStack.length > this.maxUndoDepth) this.undoStack.shift()
+    }
     this.lastStats = state.stats
     this.emit()
     return state.stats
