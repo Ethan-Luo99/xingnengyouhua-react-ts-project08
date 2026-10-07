@@ -21,6 +21,8 @@ export interface RunStats {
   failed: boolean
   /** 本轮为 undo 提交（受影响子图增量重算） */
   reverted: boolean
+  /** 本轮为 redo 提交（受影响子图增量重算） */
+  redone: boolean
 }
 
 /** 批次失败上报：错误通道只透传，绝不进入半提交状态 */

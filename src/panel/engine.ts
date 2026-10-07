@@ -62,8 +62,9 @@ interface RunState {
   /** 本批次启动时从 pendingFns/pendingFields 抽干的项：失败时需要还回去 */
   drainedFns: Set<string>
   drainedFields: Set<string>
-  /** undo 重放对应的历史记录：undo 失败时重新入栈，保留撤销点 */
-  undoLog: BatchLog | null
+  /** undo/redo 重放对应的历史记录：失败时重新入来源栈，保留撤销点/重做点 */
+  revertLog: BatchLog | null
+  revertKind: 'undo' | 'redo' | null
 }
 
 /**
@@ -124,6 +125,12 @@ export class IncrementalEngine {
   private readonly maxUndoDepth: number
   /** 已提交批次的字段级历史栈，栈顶 = 最近一次提交 */
   private readonly undoStack: BatchLog[] = []
+  /**
+   * 重做栈：undo 每成功提交一次，就把"被 undo 覆盖掉的提交前状态"作为一条
+   * 新的字段级日志压入本栈（栈顶 = 最近一次 undo）。任何新输入成功提交时
+   * 整体清空（重做线被新输入切断）；HMR 替换注册表时一并作废。
+   */
+  private readonly redoStack: BatchLog[] = []
   private lastStats: RunStats = {
     version: 0,
     executed: 0,
@@ -133,6 +140,7 @@ export class IncrementalEngine {
     implicitDepsFound: 0,
     failed: false,
     reverted: false,
+    redone: false,
   }
   private readonly listeners = new Set<() => void>()
   private inFlight: Promise<RunStats> | null = null
@@ -157,6 +165,11 @@ export class IncrementalEngine {
   /** 可撤销的已提交批次数 */
   get undoDepth(): number {
     return this.undoStack.length
+  }
+
+  /** 可重做的已撤销批次数（最近一次操作不是 undo/redo 时恒为 0） */
+  get redoDepth(): number {
+    return this.redoStack.length
   }
 
   getStats(): RunStats {
@@ -193,6 +206,7 @@ export class IncrementalEngine {
     // 函数实现已整体变更：旧历史记录里的字段旧值对新实现不再有语义，
     // 全部作废，防止 undo 跨实现版本恢复出混合语义的 ctx。
     this.undoStack.length = 0
+    this.redoStack.length = 0
     this.version++ // 使在飞批次立即过期
   }
 
@@ -358,13 +372,14 @@ export class IncrementalEngine {
 
   /**
    * 撤销最近一次已提交批次：
-   * 1. 取出栈顶 BatchLog（字段旧值 + 当轮首执行的动态函数）；
+   * 1. 从 undo 栈取出栈顶 BatchLog（字段旧值 + 当轮首执行的动态函数）；
    * 2. 旧值以 overlay 暂存（不触碰 ctx），仅把这些字段标记为 changed；
    * 3. 走同一趟顺序扫描 + dirty 传播，只重算受影响子图；
-   * 4. 成功则提交（恢复点成为新的已提交状态，不再产生 undo 记录）。
+   * 4. 成功提交时把"被覆盖的提交前状态"作为新日志压入 redo 栈——
+   *    撤销点从 undo 栈转移到 redo 栈，而不是被消费。
    */
   undoLastBatch(): RunStats {
-    const state = this.beginUndo()
+    const state = this.beginRevert('undo')
     while (!this.runSlice(state, Number.POSITIVE_INFINITY)) {
       // 同步执行到底
     }
@@ -372,7 +387,27 @@ export class IncrementalEngine {
   }
 
   async undoLastBatchChunked(budgetMs = 24): Promise<RunStats> {
-    const state = this.beginUndo()
+    const state = this.beginRevert('undo')
+    while (!this.runSlice(state, budgetMs)) await yieldToMain()
+    return this.commitRun(state)
+  }
+
+  /**
+   * 重做最近一次被撤销的批次：仅当 redo 栈非空（最近一次提交操作是
+   * undo/redo，且其后没有新输入成功提交）时可用。与 undo 完全对称：
+   * 取出 redo 栈顶日志，把其中保存的字段值以 overlay 暂存，走增量路径
+   * 只重算受影响子图；成功提交时把恢复前状态压回 undo 栈。
+   */
+  redoLastUndo(): RunStats {
+    const state = this.beginRevert('redo')
+    while (!this.runSlice(state, Number.POSITIVE_INFINITY)) {
+      // 同步执行到底
+    }
+    return this.commitRun(state)
+  }
+
+  async redoLastUndoChunked(budgetMs = 24): Promise<RunStats> {
+    const state = this.beginRevert('redo')
     while (!this.runSlice(state, budgetMs)) await yieldToMain()
     return this.commitRun(state)
   }
@@ -413,10 +448,11 @@ export class IncrementalEngine {
     return { changed, overlay, drainedFields }
   }
 
-  private beginUndo(): RunState {
-    const log = this.undoStack.pop()
+  private beginRevert(kind: 'undo' | 'redo'): RunState {
+    const source = kind === 'undo' ? this.undoStack : this.redoStack
+    const log = source.pop()
     if (!log) {
-      throw new UndoError('没有可撤销的已提交批次')
+      throw new UndoError(kind === 'undo' ? '没有可撤销的已提交批次' : '没有可重做的已撤销批次')
     }
     // 把字段恢复值暂存进 overlay；changed 只含真正变化的字段 =>
     // dirty 传播精确命中"该批次写入字段的下游子图"，非 600 全量。
@@ -460,7 +496,8 @@ export class IncrementalEngine {
         aborted: false,
         implicitDepsFound: 0,
         failed: false,
-        reverted: true,
+        reverted: kind === 'undo',
+        redone: kind === 'redo',
       },
       startedAt: now,
       chunkStart: now,
@@ -470,7 +507,8 @@ export class IncrementalEngine {
       errorValue: undefined,
       drainedFns,
       drainedFields,
-      undoLog: log,
+      revertLog: log,
+      revertKind: kind,
     }
   }
 
@@ -493,7 +531,7 @@ export class IncrementalEngine {
       forced,
       overlay,
       cursor: this.entries.entries(),
-      stats: { version, executed: 0, skipped: 0, durationMs: 0, aborted: false, implicitDepsFound: 0, failed: false, reverted: false },
+      stats: { version, executed: 0, skipped: 0, durationMs: 0, aborted: false, implicitDepsFound: 0, failed: false, reverted: false, redone: false },
       startedAt: now,
       chunkStart: now,
       failed: false,
@@ -502,7 +540,8 @@ export class IncrementalEngine {
       errorValue: undefined,
       drainedFns,
       drainedFields,
-      undoLog: null,
+      revertLog: null,
+      revertKind: null,
     }
   }
 
@@ -652,8 +691,12 @@ export class IncrementalEngine {
         if (this.entries.has(name)) this.pendingFns.add(name)
       }
       for (const field of state.drainedFields) this.pendingFields.add(field)
-      // undo 自身失败：恢复点保留，调用方可修正后重试 undo。
-      if (state.undoLog) this.undoStack.push(state.undoLog)
+      // undo/redo 自身失败：撤销点/重做点保留（压回来源栈），调用方可修正后重试。
+      // 取舍：失败 = ctx 一字段未动，恢复目标仍然有效，消耗它只会让用户丢失
+      // 明确的操作意图；保留也保证了"连续失败后最终成功 ⇔ 从未失败"的等价性。
+      if (state.revertLog) {
+        ;(state.revertKind === 'redo' ? this.redoStack : this.undoStack).push(state.revertLog)
+      }
       this.lastStats = state.stats
       this.onBatchFailure?.({ version: state.version, fnName: state.failedFn ?? '', error: state.errorValue })
       return state.stats
@@ -662,19 +705,32 @@ export class IncrementalEngine {
     // 过期批次：丢弃 overlay，不触碰 ctx，不通知订阅者。
     if (state.stats.aborted || state.version !== this.version) {
       state.stats.aborted = true
-      // undo 被更新版本打断：按引擎既有版本语义，旧批次（含其撤销意图）作废，
-      // 该撤销点在 beginUndo 时已出栈并在此消费——栈与已提交状态序列保持一致：
-      // 撤销一层 + 新提交一层，深度不变；再 undo 即恢复到新输入的前一状态。
+      // undo/redo 被更新版本打断：按引擎既有"旧批次整体丢弃"语义，旧批次
+      // （含其撤销/重做意图）作废，该恢复点在 beginRevert 时已出栈并在此消费。
       this.lastStats = state.stats
       return state.stats
     }
 
     if (state.reverted) {
-      // undo 提交：恢复字段 + 受影响子图重算结果一起落盘，不产生新历史记录。
+      // undo/redo 提交：恢复字段 + 受影响子图重算结果一起落盘。
+      // 历史不再被消费，而是转移：把"被本次恢复覆盖掉的提交前状态"记成一条
+      // 新的字段级日志压入对侧栈（undo → redo 栈，redo → undo 栈），
+      // 双栈互为对方的恢复点，任意 undo/redo 交错都能逐字段还原。
+      const revertChanges = new Map<string, unknown>()
       for (const [key, value] of state.overlay) {
+        const before = key in this.ctx ? this.ctx[key] : ABSENT
+        if (!isSameValue(before, value)) revertChanges.set(key, before)
         if (value === ABSENT) delete this.ctx[key]
         else this.ctx[key] = value
       }
+      const target = state.revertKind === 'redo' ? this.undoStack : this.redoStack
+      target.push({
+        version: state.version,
+        changes: revertChanges,
+        firstForced: new Set(state.forced),
+        fromFull: state.forceAll,
+      })
+      if (target.length > this.maxUndoDepth) target.shift()
       this.committedVersion = state.version
       this.fullInvalidation = false
       this.lastStats = state.stats
@@ -700,6 +756,8 @@ export class IncrementalEngine {
       this.undoStack.push({ version: state.version, changes, firstForced, fromFull })
       if (this.undoStack.length > this.maxUndoDepth) this.undoStack.shift()
     }
+    // 新输入成功提交：重做线被切断，redo 栈整体作废。
+    this.redoStack.length = 0
     this.lastStats = state.stats
     this.emit()
     return state.stats

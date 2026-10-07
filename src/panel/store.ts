@@ -20,10 +20,11 @@ export interface PanelStoreOptions {
  * 汇总区快照做浅比较缓存——40 个 agg 输出任一未变就返回同一引用，
  * 保证"未变化的输入不得触发汇总区 render"。
  *
- * undo 一致性：每个 undo 层级保存该提交点的汇总快照【引用】，
+ * undo/redo 一致性：每个 undo 层级保存该提交点的汇总快照【引用】，
  * 撤销时直接还原为当时的同一引用（值级恢复由引擎字段级日志保证），
- * 因此 a → b → undo 后 getAggSnapshot() === a 提交点的快照引用，
- * useSyncExternalStore/memo 行为与历史状态严格一致。
+ * 因此 a → b → undo 后 getAggSnapshot() === a 提交点的快照引用；
+ * redo 引用栈与引擎 redo 栈同步移动，undo → redo 后同样还原为
+ * 被撤销提交点的同一数组引用，useSyncExternalStore/memo 行为历史一致。
  */
 export class PanelStore {
   readonly engine: IncrementalEngine
@@ -33,6 +34,8 @@ export class PanelStore {
   private aggFields: string[]
   /** 快照引用栈：长度恒等于 engine.undoDepth + 1，栈顶 = 当前提交点 */
   private snapStack: Array<readonly unknown[]> = [this.aggSnap]
+  /** redo 快照引用栈：与引擎 redo 栈同步，栈顶 = 最近一次 undo 掉的提交点 */
+  private redoSnapStack: Array<readonly unknown[]> = []
   private undoDepthSeen = 0
 
   constructor(registry: Registry, ctx: Ctx = {}, options: PanelStoreOptions = {}) {
@@ -49,6 +52,7 @@ export class PanelStore {
     this.aggFields = collectAggFields(registry)
     this.aggSnap = Object.freeze([])
     this.snapStack = [this.aggSnap]
+    this.redoSnapStack = []
     this.undoDepthSeen = 0
     this.emit()
   }
@@ -57,11 +61,20 @@ export class PanelStore {
     this.statsSnap = this.engine.getStats()
 
     if (this.statsSnap.reverted) {
-      // undo 提交：弹出被撤销层，直接还原上一提交点的快照引用。
-      this.snapStack.pop()
+      // undo 提交：被撤销层的快照引用移入 redo 引用栈，还原上一提交点引用。
+      const popped = this.snapStack.pop()
+      if (popped) this.redoSnapStack.push(popped)
+      this.aggSnap = this.snapStack[this.snapStack.length - 1]
+      this.undoDepthSeen = this.engine.undoDepth
+    } else if (this.statsSnap.redone) {
+      // redo 提交：redo 引用栈顶弹回 undo 引用栈，恢复被撤销提交点的同一引用。
+      const popped = this.redoSnapStack.pop()
+      if (popped) this.snapStack.push(popped)
       this.aggSnap = this.snapStack[this.snapStack.length - 1]
       this.undoDepthSeen = this.engine.undoDepth
     } else {
+      // 新输入成功提交：重做线被切断，redo 引用栈同步清空。
+      this.redoSnapStack.length = 0
       const next = this.aggFields.map((field) => this.engine.ctx[field])
       const same =
         next.length === this.aggSnap.length &&
@@ -94,6 +107,8 @@ export class PanelStore {
 
   getUndoDepth = (): number => this.engine.undoDepth
 
+  getRedoDepth = (): number => this.engine.redoDepth
+
   /** 事件层驱动重算（绝不在 render 内执行）；失败批次返回 failed 统计（ctx 已回滚） */
   setInput(text: string): RunStats {
     return this.engine.applyInput({ [INPUT_FIELD]: text })
@@ -106,6 +121,15 @@ export class PanelStore {
 
   undoLastBatchChunked(budgetMs = 24): Promise<RunStats> {
     return this.engine.undoLastBatchChunked(budgetMs)
+  }
+
+  /** 重做最近一次被撤销的批次（只重算受影响子图）；无可重做项时抛 UndoError */
+  redoLastUndo(): RunStats {
+    return this.engine.redoLastUndo()
+  }
+
+  redoLastUndoChunked(budgetMs = 24): Promise<RunStats> {
+    return this.engine.redoLastUndoChunked(budgetMs)
   }
 
   /** 幂等初始化：StrictMode 双调用 mount effect 安全 */
